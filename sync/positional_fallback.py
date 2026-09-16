@@ -18,7 +18,10 @@ candidate-density/distance/magnitude-gap analysis:
    it (see ingest.add_star.add_bsc_star's own docstring for why those ~70
    stars have no phot_g_mean_mag at all -- treating that as "no magnitude
    info" would rank the brightest stars in the sky as the LEAST plausible
-   candidates, backwards).
+   candidates, backwards). Only when exactly one BSC5 star is in range,
+   though -- see BSC5_DISAMBIGUATION_RATIO for the close-visual-binary case
+   (e.g. Alpha Cen A/B) where two BSC5 stars are both nearby and brightness
+   can't tell them apart the way it does against a Gaia candidate.
 3. Otherwise, drop any candidate fainter than that archive's empirical
    faintness ceiling (see ARCHIVE_FAINTNESS_CEILING_MAG): a handful of
    "sole candidate in the field" hits were observed at G=18-20, implausibly
@@ -131,6 +134,27 @@ MAG_CONTRAST_THRESHOLD_MAG = 2.0
 # See module docstring point 5 -- NOT empirically calibrated, a starting
 # guard only.
 PROXIMITY_OVERRIDE_RATIO = 3.0
+
+# Guards the BSC5 categorical-win rule (point 2) against its own blind spot:
+# it's sound when there's at most one BSC5 star nearby (nothing Gaia sees
+# can outshine a naked-eye star), but says nothing about *which* BSC5 star
+# it is when two are both in range -- brightness can't disambiguate between
+# them the way it does against a Gaia candidate, since neither has a
+# phot_g_mean_mag at all. Confirmed live (2026-09-16): Alpha Cen A and B
+# (HR 5459/5460) sit only ~10-15" apart on sky and both carry the same
+# Hipparcos ref_epoch (1991.25) with a simple linear proper-motion model
+# that doesn't capture their ~80-year mutual orbit's curvature -- over a
+# multi-decade extrapolation both propagated positions drift by a similar,
+# large (tens of arcsec) amount, so whichever ends up marginally closer for
+# a given record was essentially a coin flip of propagation error, not
+# evidence about which star was actually observed. The nearest BSC5
+# candidate must beat the runner-up by this ratio (same shape as
+# PROXIMITY_OVERRIDE_RATIO, kept separate since it guards a different
+# comparison -- separation vs. separation, not magnitude vs. separation) or
+# the match is treated as ambiguous rather than a confident categorical win.
+# NOT empirically calibrated beyond the Alpha Cen A/B case that surfaced it --
+# a starting guard, not a tuned constant.
+BSC5_DISAMBIGUATION_RATIO = 2.0
 
 # phot_g_mean_mag percentiles (p99) of stars behind each archive's own
 # already-CONFIRMED matches (match_status='matched'), queried from
@@ -411,7 +435,18 @@ def pick_best_candidate(archive_code: str, candidates: list[Candidate]) -> tuple
 
     bsc5_candidates = [c for c in candidates if c.source_catalog == "bsc5"]
     if bsc5_candidates:
-        winner = min(bsc5_candidates, key=lambda c: c.separation_arcsec)
+        bsc5_candidates.sort(key=lambda c: c.separation_arcsec)
+        winner = bsc5_candidates[0]
+        if len(bsc5_candidates) > 1:
+            runner_up = bsc5_candidates[1]
+            # See BSC5_DISAMBIGUATION_RATIO -- two+ BSC5 stars in range (a
+            # close naked-eye visual binary, most notably) can't be told
+            # apart by brightness the way a BSC5-vs-Gaia comparison can.
+            if runner_up.separation_arcsec < winner.separation_arcsec * BSC5_DISAMBIGUATION_RATIO:
+                return None, (
+                    f"{len(bsc5_candidates)} BSC5 bright stars within radius, too close together "
+                    "to disambiguate by position alone"
+                )
         return winner, "bsc5 bright-star match (categorical win)"
 
     ceiling = faintness_ceiling_mag(archive_code)
@@ -656,7 +691,25 @@ def _process_cell(conn: psycopg.Connection, cell: int, cell_entries: list[tuple[
                         # A live-Gaia-only hit -- register it the same way
                         # ingest.add_star.discover_stars does, so future syncs
                         # (and future runs of this fallback) see it as tracked too.
-                        add_stars_batch(conn, [winner.gaia_source_id])
+                        # offline=True deliberately: this run already fetched the
+                        # cell's Gaia pool from the local gaia_source_lite_mirror
+                        # (see _gaia_healpix_pool), so paying for a live TAP+ round
+                        # trip here just to register one star is a needless
+                        # per-record network dependency in the middle of an
+                        # otherwise-local matching loop -- observed live (2026-09-15)
+                        # repeatedly stalling a --skipped-only resume for minutes at
+                        # a time on TAP+ retries/backoff, one star at a time. The
+                        # mirror only carries source_id/ra/dec/pmra/pmdec/
+                        # phot_g_mean_mag, so a star added this way lands with
+                        # parallax/phot_bp_mean_mag/phot_rp_mean_mag/has_gaia_rvs/
+                        # has_xp_continuous left NULL/False -- same gap as the old
+                        # gaia_degraded fallback used to leave, just unconditional
+                        # now instead of only-on-TAP-failure. scripts.
+                        # backfill_gaia_astrometry (run weekly via scripts/
+                        # weekly_sync_export.sh) fills those in afterward from a
+                        # live Gaia query, batched across every pending star at
+                        # once rather than one-by-one here.
+                        add_stars_batch(conn, [winner.gaia_source_id], offline=True)
                         with conn.cursor() as lookup_cur:
                             lookup_cur.execute("SELECT star_id FROM stars WHERE gaia_source_id = %s", (winner.gaia_source_id,))
                             star_id = lookup_cur.fetchone()[0]

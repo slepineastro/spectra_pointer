@@ -8,23 +8,30 @@ scripts.export_to_parquet from the real Postgres database (wherever that
 runs) directly into morgan's ~/public_html, which joy's Apache (mod_userdir)
 already serves publicly — morgan and joy share the same NFS home directory,
 so nothing needs to explicitly sync/publish anything. This app reads it
-straight over HTTP via DuckDB's httpfs extension (SPECTRA_DATA_URL, what the
-hosted Cloud Run service uses), or from a local directory (SPECTRA_DATA_DIR)
-for local dev.
+straight over HTTP via DuckDB's httpfs extension (SPECTRA_DATA_URL), or from
+a local directory (SPECTRA_DATA_DIR) -- the hosted joy deployment uses
+SPECTRA_DATA_DIR, since the app runs colocated with the exported snapshot on
+the same NFS mount; SPECTRA_DATA_URL is for running this app somewhere else
+(local dev, or any future non-joy host) against the published copy over
+plain HTTP.
 
 The one exception is /triage's classification submissions, which do need to
 persist somewhere: rather than opening a write path from this public,
 unauthenticated web tier to Postgres, they're appended as JSON lines to
-another public file on joy over a narrowly-scoped SSH connection (see
-_append_triage_submission / _joy_ssh_client below) and only actually land in
-skip_classifications the next time scripts.export_to_parquet runs and
-imports them.
+another public file. Under SPECTRA_DATA_DIR (what production uses) that's a
+direct, flock-guarded local append (see _append_triage_submission_local);
+under SPECTRA_DATA_URL it goes instead over a narrowly-scoped SSH connection
+to joy (see _append_triage_submission / _joy_ssh_client below) since there's
+no local filesystem access to write through in that mode. Either way, the
+submission only actually lands in skip_classifications the next time
+scripts.export_to_parquet runs and imports it.
 
 Run locally against a local export:
     python3 -m scripts.export_to_parquet --out-dir ./data
     SPECTRA_DATA_DIR=./data python3 -m webapp.app
 
-Run against the hosted snapshot (what Cloud Run does):
+Run against the hosted snapshot over HTTP (for a dev/staging instance not
+colocated with the data -- not what the joy deployment itself does):
     SPECTRA_DATA_URL=http://joy.chara.gsu.edu/~way/spectra_data python3 -m webapp.app
 """
 
@@ -57,6 +64,7 @@ import skyplothelper.plotly as sph_plotly
 from astropy.coordinates import SkyCoord
 from flask import Flask, Response, abort, redirect, render_template_string, request, stream_with_context
 from pyvo.dal.exceptions import DALServiceError
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from ingest.add_star import (
     _launch_gaia_job,
@@ -76,13 +84,64 @@ from webapp.spectrum_viewer import (
 )
 
 app = Flask(__name__)
+# Lets the app run correctly behind a reverse proxy that mounts it under a
+# subpath (joy's Apache serves it at /~way/spectra_pointer/) -- reads
+# X-Forwarded-Prefix/-Proto/-Host/-For so url_for() and redirects produce
+# paths under that prefix instead of root-relative ones. A no-op when those
+# headers aren't sent, so it doesn't change anything for local dev run
+# directly against gunicorn/Flask's dev server, without the proxy in front.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
+# ProxyFix (above) only fixes up SCRIPT_NAME/url_for() -- but every nav
+# link, form action, and JS fetch() in this app's hand-written HTML is a
+# hardcoded absolute path (e.g. `href="/instruments"`), not url_for(), so
+# none of them pick up the subpath automatically. Rewrite them here
+# instead of touching every template. No-op when not mounted under a
+# prefix (e.g. local dev without the proxy in front), since
+# request.script_root is only ever set by ProxyFix's X-Forwarded-Prefix
+# handling.
+# Every hardcoded-absolute-path spot found so far (href=/src=/action=
+# attributes, fetch('/...'), window.location(.href) = '/...', a plain
+# element.href = '/...', a JS helper's `return '/...'`) reduces to the same
+# shape once you strip whitespace: a leading-slash string literal right
+# after an `=`, a `(`, or a `return` keyword. One general pattern instead
+# of a growing pile of syntax-specific ones -- and a single combined sub()
+# pass (not several run back to back) so an already-rewritten
+# `href="{prefix}/..."` can't get matched a second time and prefixed twice.
+_ABS_PATH_RE = re.compile(rb'(=|\(|\breturn)\s*(["\'])/(?!/)')
+
+
+@app.after_request
+def _rewrite_links_for_subpath_mount(response):
+    prefix = request.script_root
+    if not prefix:
+        return response
+
+    # redirect()'s Location header is root-relative too (no _external=True
+    # anywhere in this app), and it's a header, not body text -- the body
+    # rewrite below can never touch it. A relative Location resolves against
+    # the origin root per HTTP semantics, so /triage/submit's redirect back
+    # to /triage was landing on the proxy's origin root and 404ing there,
+    # even though the POST itself succeeded (confirmed via gunicorn's access
+    # log showing a normal 302 for that request).
+    location = response.headers.get("Location")
+    if location and location.startswith("/") and not location.startswith("//"):
+        response.headers["Location"] = prefix + location
+
+    if response.content_type and "text/html" in response.content_type:
+        prefix_bytes = prefix.encode()
+        body = response.get_data()
+        body = _ABS_PATH_RE.sub(lambda m: m.group(1) + m.group(2) + prefix_bytes + b"/", body)
+        response.set_data(body)
+    return response
+
 
 # Set on the old renamed-away service (e.g. the original spectra-database
 # Cloud Run URL) so every request there shows a moved notice with a link to
 # the current site, instead of just going dark or silently redirecting --
 # keeps old bookmarks/links understandable during the decommission window.
 _REDIRECT_BASE_URL = os.environ.get("REDIRECT_BASE_URL", "").rstrip("/")
-_MOVED_NOTICE_DEADLINE = "September 5, 2026"
+_MOVED_NOTICE_DEADLINE = "October 15th, 2026"
 
 if _REDIRECT_BASE_URL:
     @app.before_request
@@ -90,6 +149,15 @@ if _REDIRECT_BASE_URL:
         target = _REDIRECT_BASE_URL + request.path
         if request.query_string:
             target += "?" + request.query_string.decode()
+        # request.host_url, not _REDIRECT_BASE_URL, in the "will be taken
+        # offline" line below -- _REDIRECT_BASE_URL is the destination
+        # you're being sent to, not this page. Got that backwards the first
+        # time this was written (for the spectra-database -> spectra-pointer
+        # Cloud Run rename) and it went unnoticed since nobody reads a
+        # moved-notice page closely; caught this time around because it
+        # actually confused someone testing the new spectra-pointer -> joy
+        # redirect.
+        this_address = request.host_url.rstrip("/")
         return f"""
 <!doctype html>
 <html>
@@ -100,11 +168,10 @@ if _REDIRECT_BASE_URL:
 </head>
 <body>
   <h1>This site has moved</h1>
-  <p>Spectra Database has been renamed <b>The Spectra Pointer</b>
-    and now lives at a new address:</p>
+  <p><b>The Spectra Pointer</b> now lives at a new address:</p>
   <p><a href="{target}">{target}</a></p>
-  <p class="note">This address ({_REDIRECT_BASE_URL}) will be taken offline
-    around {_MOVED_NOTICE_DEADLINE} -- please update any bookmarks or links.</p>
+  <p class="note">This address ({this_address}) will be taken offline
+    {_MOVED_NOTICE_DEADLINE} -- please update any bookmarks or links.</p>
 </body>
 </html>
 """
@@ -133,9 +200,10 @@ def _resolve_data_source() -> str:
     if local_dir:
         return local_dir.rstrip("/")
     raise RuntimeError(
-        "Set SPECTRA_DATA_URL (e.g. http://joy.chara.gsu.edu/~way/spectra_data "
-        "— what the hosted service uses) or SPECTRA_DATA_DIR (local export) — "
-        "see webapp.app's module docstring."
+        "Set SPECTRA_DATA_DIR (local export directory — what the hosted joy "
+        "deployment uses) or SPECTRA_DATA_URL (e.g. "
+        "http://joy.chara.gsu.edu/~way/spectra_data, for a non-colocated "
+        "instance) — see webapp.app's module docstring."
     )
 
 
@@ -155,7 +223,7 @@ def _make_connection() -> duckdb.DuckDBPyConnection:
     # fields, rather than one table per field like everything else here.
     con.execute(f"CREATE VIEW stats_summary AS SELECT * FROM read_json_auto('{source}/stats_summary.json')")
     # /info's "Who's using The Spectra Pointer?" map -- country-level request
-    # counts derived from Cloud Run's own request logs, published
+    # counts derived from joy's own gunicorn access log, published
     # independently by scripts.build_access_heatmap (see that module for the
     # privacy reasoning) on its own schedule rather than as part of this
     # export pipeline. A fresh SPECTRA_DATA_DIR/out_dir that hasn't had that
@@ -166,7 +234,7 @@ def _make_connection() -> duckdb.DuckDBPyConnection:
     except duckdb.Error:
         con.execute(
             "CREATE VIEW access_heatmap AS SELECT "
-            "NULL::VARCHAR AS generated_at, 0::BIGINT AS total_requests, "
+            "NULL::VARCHAR AS generated_at, 0::BIGINT AS total_requests, 30::BIGINT AS window_days, "
             "[]::STRUCT(country VARCHAR, country_code VARCHAR, count BIGINT)[] AS countries"
         )
     return con
@@ -580,7 +648,7 @@ def _radial_search(ra_str: str, dec_str: str, radius_str: str, export_csv: bool,
 # executing thread within milliseconds of being called). Runs `sql` on a
 # background thread and interrupts+raises TimeoutError if it doesn't finish
 # within timeout_seconds, so a caller can show a clean error instead of the
-# request just hanging until Cloud Run's own request timeout kills it.
+# request just hanging until the web server's own request timeout kills it.
 def _execute_with_timeout(cur: duckdb.DuckDBPyConnection, sql: str, params: list, timeout_seconds: float) -> None:
     outcome: dict = {}
 
@@ -1552,7 +1620,7 @@ def _lookup_local_star(cur: duckdb.DuckDBPyConnection, query: str) -> dict | Non
         # export's sort order for row-group pruning (see
         # scripts/export_to_parquet.py's `stars` ORDER BY) instead of
         # pulling the entire multi-hundred-MB file into memory and OOMing
-        # the Cloud Run container.
+        # the web process.
         n = int(query)
         cur.execute("SELECT * FROM stars WHERE gaia_source_id = ?", [n])
         rows = _rows_as_dicts(cur)
@@ -2458,7 +2526,7 @@ def leaderboard():
     # in. See that module for why: an earlier version of this route did the
     # top-5 selection here in Python, which meant sorted() over the full
     # (multi-million-star) population once per period — observed as
-    # what was actually OOMing the Cloud Run container, not the raw GROUP BY.
+    # what was actually OOMing the web process, not the raw GROUP BY.
     cur.execute("SELECT star_id, gaia_source_id, bsc_hr_number, label, yr, half, within_n, cumulative_n FROM leaderboard ORDER BY star_id, yr, half")
     rows = _rows_as_dicts(cur)
     period_labels, leaderboard_traces = _period_traces_by_star(rows, ["within_n", "cumulative_n"])
@@ -2575,6 +2643,14 @@ INSTRUMENT_RESOLVING_POWER: dict[tuple[str, str], str] = {
     ('CARMENES', 'CARMENES VIS'): 'R ≈ 94,600',
     ('CARMENES (CAHA archive, VIS+NIR)', 'CARMENES NIR'): 'R ≈ 80,600',
     ('CARMENES (CAHA archive, VIS+NIR)', 'CARMENES VIS'): 'R ≈ 94,600',
+    # Same physical instrument as the two CARMENES entries above -- these are
+    # just different derived data products (a co-added telluric-corrected
+    # template library and a fixed input catalog snapshot) over the same
+    # CAHA-hosted VIS/NIR channels, so the R doesn't change.
+    ('CARMENES Telluric-Corrected Template Library', 'CARMENES VIS'): 'R ≈ 94,600',
+    ('CARMENES Telluric-Corrected Template Library', 'CARMENES NIR'): 'R ≈ 80,600',
+    ('CARMENES Reiners et al. 2018 Input Catalog', 'CARMENES VIS'): 'R ≈ 94,600',
+    ('CARMENES Reiners et al. 2018 Input Catalog', 'CARMENES NIR'): 'R ≈ 80,600',
     ('CFHT / CADC', 'SPIRou'): 'R ≈ 70,000',
     ('CFHT / CADC', 'ESPaDOnS'): 'R ≈ 68,000 (spectroscopy mode)',
     ('CFHT / CADC', 'MegaPrime'): 'n/a (wide-field imager)',
@@ -2682,7 +2758,7 @@ INSTRUMENT_RESOLVING_POWER: dict[tuple[str, str], str] = {
     ('IRTF SpeX (via IRSA)', 'SpeX'): 'R ≈ 200 (prism) – 2,500 (cross-dispersed)',
     ('IRTF iSHELL (via IRSA)', 'iSHELL'): 'R ≈ 80,000 (0.375" slit)',
     ('IRTF Legacy Archive', 'SpeX'): 'R ≈ 200 (prism) – 2,500 (cross-dispersed)',
-    ('IRTF Legacy Archive', 'CSHELL'): '—',
+    ('IRTF Legacy Archive', 'CSHELL'): 'R ≈ 5,000–43,000 (slit-dependent)',
     ('Keck Observatory Archive', 'NIRSPEC'): 'R ≈ 2,000–25,000 (mode-dependent)',
     ('Keck Observatory Archive', 'HIRES'): 'R ≈ 25,000–85,000 (slit-dependent)',
     ('Keck Observatory Archive', 'MOSFIRE'): 'R ≈ 3,600',
@@ -2986,8 +3062,8 @@ def instrument_holdings_csv():
     in stream_with_context, DuckDB read via fetchmany in a loop) rather than
     _csv_response's build-the-whole-string-in-memory-then-return approach
     used elsewhere in this file for much smaller result sets -- constant
-    memory regardless of archive size, matching this project's GCP
-    cost-minimization stance. No join against `stars` (e.g. for
+    memory regardless of archive size, matching this project's general
+    memory-discipline stance. No join against `stars` (e.g. for
     gaia_source_id) -- a single-table scan+filter is dramatically cheaper
     at this scale than a join across two multi-million-row tables, and
     star_id is still exported as the cross-reference key."""
@@ -3241,7 +3317,7 @@ INSTRUMENTS_TEMPLATE = """
 
   <hr>
   <h2>Tracked instruments</h2>
-  <p class="note">Every instrument seen in current holdings, grouped by archive, with an approximate resolving power (R = &lambda;/&Delta;&lambda;) hand-maintained from published specs, not derived from the database. This says the instrument is covered by the sync, not that every star has data from it. A range is shown where R varies by grating/mode. "n/a" marks imagers; "&mdash;" marks ones not yet looked up.</p>
+  <p class="note">Every instrument seen in current holdings, grouped by archive, with an approximate resolving power (R = &lambda;/&Delta;&lambda;) and wavelength coverage hand-maintained from published specs, not derived from the database. This says the instrument is covered by the sync, not that every star has data from it. A range is shown where R varies by grating/mode. "n/a" marks imagers; "&mdash;" marks ones not yet looked up.</p>
   {% for a in instruments %}
   <details>
     <summary class="summary-row">
@@ -3249,9 +3325,9 @@ INSTRUMENTS_TEMPLATE = """
       <span class="summary-count">{{ a.instruments|length }} instrument{{ "s" if a.instruments|length != 1 else "" }}</span>
     </summary>
     <table>
-      <tr><th>Instrument</th><th>Holdings</th><th>Resolving power</th></tr>
+      <tr><th>Instrument</th><th>Holdings</th><th>Resolving power</th><th>Wavelength coverage</th></tr>
       {% for i in a.instruments %}
-      <tr><td>{{ i.instrument }}</td><td>{{ "{:,}".format(i.n) }}</td><td>{{ i.resolving_power }}</td></tr>
+      <tr><td>{{ i.instrument }}</td><td>{{ "{:,}".format(i.n) }}</td><td>{{ i.resolving_power }}</td><td>{{ i.wave_range }}</td></tr>
       {% endfor %}
     </table>
   </details>
@@ -3264,7 +3340,7 @@ INSTRUMENTS_TEMPLATE = """
     <div class="overlap-controls">
       <select id="instrument-sky-select">
         {% for opt in instrument_sky_options %}
-          <option value="{{ opt.instrument }}"{{ " selected" if opt.instrument == selected_instrument else "" }}>{{ opt.instrument }} ({{ "{:,}".format(opt.total) }})</option>
+          <option value="{{ opt.instrument }}"{{ " selected" if opt.instrument == selected_instrument else "" }}>{{ opt.instrument }} ({{ "{:,}".format(opt.total) }}{{ ", " + opt.wave_range if opt.wave_range else "" }})</option>
         {% endfor %}
       </select>
     </div>
@@ -3761,10 +3837,12 @@ def instruments_page():
 
     instruments_by_archive: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
+        coverage = INSTRUMENT_WAVELENGTH_RANGE_NM.get((r["display_name"], r["instrument"]))
         instruments_by_archive[r["display_name"]].append({
             "instrument": r["instrument"],
             "n": r["n"],
             "resolving_power": INSTRUMENT_RESOLVING_POWER.get((r["display_name"], r["instrument"]), "—"),
+            "wave_range": f"{coverage[0]:g}–{coverage[1]:g} nm" if coverage else "—",
         })
     instruments = [
         {
@@ -3787,6 +3865,21 @@ def instruments_page():
     # archive_overlap).
     cur.execute("SELECT instrument, sum(n) AS total FROM instrument_healpix WHERE instrument != '' GROUP BY instrument ORDER BY total DESC, instrument")
     instrument_sky_options = _rows_as_dicts(cur)
+
+    # Same INSTRUMENT_WAVELENGTH_RANGE_NM the chart above draws from, but
+    # keyed down to instrument name alone (first (display_name, instrument)
+    # match wins, same collapse-by-instrument-name assumption
+    # _all_instrument_wavelength_bars makes) so the dropdown can show it too
+    # without a second archive-aware lookup -- instrument_healpix itself has
+    # no display_name column to join on.
+    instrument_wavelength_nm: dict[str, tuple[float, float]] = {}
+    for r in rows:
+        coverage = INSTRUMENT_WAVELENGTH_RANGE_NM.get((r["display_name"], r["instrument"]))
+        if coverage is not None:
+            instrument_wavelength_nm.setdefault(r["instrument"], coverage)
+    for opt in instrument_sky_options:
+        coverage = instrument_wavelength_nm.get(opt["instrument"])
+        opt["wave_range"] = f"{coverage[0]:g}–{coverage[1]:g} nm" if coverage else None
 
     # request.args.get(..., "") -- rather than the no-default form -- would
     # make an absent ?instrument= param indistinguishable from an explicit
@@ -4037,10 +4130,10 @@ INFO_TEMPLATE = """
     <img class="logo-placeholder" src="/static/logo.png" alt="The Spectra Pointer logo">
   </div>""" + NAV_HTML + """
   <h2>Who's using The Spectra Pointer?</h2>
-  <p class="note">Country-level counts derived from Cloud Run's request logs — client IPs are geocoded to a country and discarded in the same step (see <code>scripts/build_access_heatmap.py</code> for the full privacy reasoning). No IP address is ever written to disk by this project; only the aggregate counts below are kept, and Google's own Cloud Logging deletes the underlying request logs after 30 days regardless. Counts include every client that requested the site (browsers, crawlers, unfiltered uptime checks), not just human visitors — treat this as indicative, not precise analytics.{% if access_heatmap_generated_at %} Last updated {{ access_heatmap_generated_at }}.{% endif %}</p>
+  <p class="note">Country-level counts derived from this site's own request logs — client IPs are geocoded to a country and discarded in the same step (see <code>scripts/build_access_heatmap.py</code> for the full privacy reasoning). No IP address is ever written to disk by this project, and the underlying request log itself is trimmed on the same schedule (see <code>scripts/trim_access_log.py</code>); only the aggregate counts below are kept, and only for the trailing window shown. Counts include every client that requested the site (browsers, crawlers, unfiltered uptime checks), not just human visitors — treat this as indicative, not precise analytics.{% if access_heatmap_generated_at %} Last updated {{ access_heatmap_generated_at }}.{% endif %}</p>
   {% if access_heatmap_countries %}
     <div id="access-heatmap-plot" style="width: 100%; height: 450px;"></div>
-    <p>{{ "{:,}".format(access_heatmap_total) }} requests across {{ access_heatmap_countries|length }} countries.</p>
+    <p>{{ "{:,}".format(access_heatmap_total) }} requests across {{ access_heatmap_countries|length }} countries in the past {{ access_heatmap_window_days }} days.</p>
     <script>
       (function() {
         const countries = {{ access_heatmap_countries | tojson }};
@@ -4208,9 +4301,9 @@ def info():
     cur.execute("SELECT archive_code, display_name, n FROM skipped_by_archive ORDER BY n DESC")
     skipped_by_archive = _rows_as_dicts(cur)
 
-    cur.execute("SELECT generated_at, total_requests, countries FROM access_heatmap")
+    cur.execute("SELECT generated_at, total_requests, window_days, countries FROM access_heatmap")
     access_heatmap_row = cur.fetchone()
-    access_heatmap_generated_at, access_heatmap_total, access_heatmap_countries = access_heatmap_row
+    access_heatmap_generated_at, access_heatmap_total, access_heatmap_window_days, access_heatmap_countries = access_heatmap_row
 
     # The per-archive filter is a rare, deliberate user action (not the
     # default page load), and cheap once narrowed to one archive_code -- kept
@@ -4241,7 +4334,7 @@ def info():
         needs_review=needs_review, needs_review_total=needs_review_total,
         skipped=skipped, skipped_by_archive=skipped_by_archive, archive_filter=archive_filter,
         access_heatmap_generated_at=access_heatmap_generated_at, access_heatmap_total=access_heatmap_total,
-        access_heatmap_countries=access_heatmap_countries,
+        access_heatmap_window_days=access_heatmap_window_days, access_heatmap_countries=access_heatmap_countries,
     )
 
 
@@ -4438,7 +4531,7 @@ def batch_search():
 # the module docstring) -- this is the app's first genuine write path. An
 # earlier version of this opened a live psycopg connection via DATABASE_URL
 # straight to Postgres, but DATABASE_URL is deliberately never set on the
-# hosted Cloud Run deployment: this is a public, unauthenticated web tier,
+# hosted joy deployment: this is a public, unauthenticated web tier,
 # and giving it direct write access to the real database is a bigger blast
 # radius than this feature is worth. Submissions are appended instead as
 # JSON lines to a public file on joy (same host/directory
@@ -4453,8 +4546,8 @@ TRIAGE_SUBMISSIONS_FILENAME = "triage_submissions.jsonl"
 
 def _joy_ssh_client() -> paramiko.SSHClient:
     """A dedicated, narrowly-scoped SSH key -- never committed to this repo,
-    configured entirely via env vars (Cloud Run Secret Manager in
-    production) -- connects to joy to append one classification submission.
+    configured entirely via env vars set outside the repo on joy in
+    production -- connects to joy to append one classification submission.
     The corresponding authorized_keys entry on joy MUST use a forced
     `command=` restriction (see scripts/joy_triage_append.py's setup
     docstring) so this key can only ever run that one append script, never
@@ -4515,7 +4608,41 @@ _joy_ssh_lock = threading.Lock()
 _joy_ssh_client_cache: paramiko.SSHClient | None = None
 
 
+def _append_triage_submission_local(payload: dict, data_dir: str) -> None:
+    """When this process already has direct filesystem access to the data
+    directory (SPECTRA_DATA_DIR -- e.g. running on joy itself), append
+    straight to the file instead of paying for an SSH round trip to itself.
+    Lazy-imports joy_triage_append (only needed for this SPECTRA_DATA_DIR
+    path -- no reason to pay the import cost when running against
+    SPECTRA_DATA_URL instead, where this function never runs) to reuse its
+    validation so both write paths enforce identically-shaped submissions,
+    and its own flock-guarded append so this is safe against
+    scripts.export_to_parquet or another worker reading/writing concurrently.
+    """
+    import fcntl
+
+    from scripts.joy_triage_append import validate
+
+    error = validate(payload)
+    if error:
+        raise RuntimeError(f"invalid submission: {error}")
+    target_path = os.path.join(data_dir, TRIAGE_SUBMISSIONS_FILENAME)
+    line = json.dumps(payload, separators=(",", ":")) + "\n"
+    with open(target_path, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.write(line)
+            f.flush()
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
 def _append_triage_submission(payload: dict) -> None:
+    source = _resolve_data_source()
+    if not (source.startswith("http://") or source.startswith("https://")):
+        _append_triage_submission_local(payload, source)
+        return
+
     global _joy_ssh_client_cache
     data = json.dumps(payload, separators=(",", ":")) + "\n"
 
@@ -4688,9 +4815,10 @@ def _simbad_coord_url(ra: float, dec: float) -> str:
 #
 # archive_url is data this app already trusts enough to render as an outbound
 # <a href>, but here the *server* is the one making the request, off a
-# visitor-supplied query-string value -- on a public, unauthenticated Cloud
-# Run service that turns an unrestricted URL param into an SSRF proxy against
-# anything reachable from the container (notably the GCP metadata server).
+# visitor-supplied query-string value -- on a public, unauthenticated web
+# tier that turns an unrestricted URL param into an SSRF proxy against
+# anything reachable from the host (internal network services, localhost
+# ports, etc.).
 # The fix is an explicit hostname allowlist, not just a scheme check --
 # it's the exact host set observed across every archive_url in production
 # (see spectroscopy_holdings, one entry per sync/archives/*.py module), so it
@@ -5115,11 +5243,11 @@ def triage():
     # scripts/export_to_parquet.py's TRIAGE_QUEUE_QUERY) rather than grouping
     # spectroscopy_holdings live -- a true GROUP BY (archive_code,
     # raw_target_name) over the full skipped set (12M+ rows, 900K+ distinct
-    # names) OOMs the 1 GiB Cloud Run container, observed against
-    # production. Precomputing where memory isn't capped also means this can
-    # be a cheap, small read instead of a multi-second remote scan on every
-    # page load -- this project tries to keep Cloud Run request time (and
-    # therefore cost) down wherever the data doesn't need to be live-fresh,
+    # names) OOMs the web process, observed against production. Precomputing
+    # where memory isn't capped also means this can be a cheap, small read
+    # instead of a multi-second remote scan on every page load -- this
+    # project tries to keep request time down wherever the data doesn't
+    # need to be live-fresh,
     # and a "run the export by hand every so often" cadence is already how
     # every other derived page here works. No ORDER BY/LIMIT here -- the
     # whole (already-capped-upstream) pool is fetched and reshuffled in
